@@ -1,0 +1,27 @@
+{
+  "name": "pi-extension-handoff",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone pi extension package for handoff.",
+  "keywords": [
+    "pi-package",
+    "pi-extension"
+  ],
+  "scripts": {
+    "build": "echo 'nothing to build'",
+    "check": "echo 'nothing to check'"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./handoff.ts"
+    ]
+  }
+}

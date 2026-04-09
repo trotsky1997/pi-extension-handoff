@@ -14,7 +14,14 @@
 
 import { complete, type Message } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, SessionEntry } from "@mariozechner/pi-coding-agent";
-import { BorderedLoader, convertToLlm, serializeConversation } from "@mariozechner/pi-coding-agent";
+import {
+	BorderedLoader,
+	convertToLlm,
+	getAgentDir,
+	serializeConversation,
+} from "@mariozechner/pi-coding-agent";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
 const SYSTEM_PROMPT = `You are a context transfer assistant. Given a conversation history and the user's goal for a new thread, generate a focused prompt that:
 
@@ -38,6 +45,38 @@ Files involved:
 ## Task
 [Clear description of what to do next based on user's goal]`;
 
+const DEFAULT_GOAL = "continue the current implementation task";
+
+interface HandoffConfig {
+	defaultGoal?: string;
+	defaultTarget?: string;
+}
+
+function readHandoffConfig(path: string): HandoffConfig {
+	if (!existsSync(path)) {
+		return {};
+	}
+
+	try {
+		return JSON.parse(readFileSync(path, "utf-8")) as HandoffConfig;
+	} catch (err) {
+		console.error("Failed to load handoff config from", path, err);
+		return {};
+	}
+}
+
+function getConfiguredDefaultGoal(cwd: string): string | undefined {
+	const globalConfig = readHandoffConfig(join(getAgentDir(), "handoff.json"));
+	const projectConfig = readHandoffConfig(join(cwd, ".pi", "handoff.json"));
+	const configuredGoal =
+		projectConfig.defaultGoal ??
+		projectConfig.defaultTarget ??
+		globalConfig.defaultGoal ??
+		globalConfig.defaultTarget;
+	const goal = configuredGoal?.trim();
+	return goal ? goal : undefined;
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.registerCommand("handoff", {
 		description: "Transfer context to a new focused session",
@@ -52,16 +91,16 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const goal = args.trim();
-			if (!goal) {
-				ctx.ui.notify("Usage: /handoff <goal for new thread>", "error");
-				return;
-			}
+			const goal =
+				args.trim() || getConfiguredDefaultGoal(ctx.cwd) || DEFAULT_GOAL;
 
 			// Gather conversation context from current branch
 			const branch = ctx.sessionManager.getBranch();
 			const messages = branch
-				.filter((entry): entry is SessionEntry & { type: "message" } => entry.type === "message")
+				.filter(
+					(entry): entry is SessionEntry & { type: "message" } =>
+						entry.type === "message",
+				)
 				.map((entry) => entry.message);
 
 			if (messages.length === 0) {
@@ -75,49 +114,68 @@ export default function (pi: ExtensionAPI) {
 			const currentSessionFile = ctx.sessionManager.getSessionFile();
 
 			// Generate the handoff prompt with loader UI
-			const result = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
-				const loader = new BorderedLoader(tui, theme, `Generating handoff prompt...`);
-				loader.onAbort = () => done(null);
+			const result = await ctx.ui.custom<string | null>(
+				(tui, theme, _kb, done) => {
+					const loader = new BorderedLoader(
+						tui,
+						theme,
+						`Generating handoff prompt...`,
+					);
+					loader.onAbort = () => done(null);
 
-				const doGenerate = async () => {
-					const apiKey = await ctx.modelRegistry.getApiKey(ctx.model!);
+					const doGenerate = async () => {
+						const auth = await ctx.modelRegistry.getApiKeyAndHeaders(
+							ctx.model!,
+						);
+						if (!auth.ok || !auth.apiKey) {
+							throw new Error(
+								auth.ok ? `No API key for ${ctx.model!.provider}` : auth.error,
+							);
+						}
 
-					const userMessage: Message = {
-						role: "user",
-						content: [
+						const userMessage: Message = {
+							role: "user",
+							content: [
+								{
+									type: "text",
+									text: `## Conversation History\n\n${conversationText}\n\n## User's Goal for New Thread\n\n${goal}`,
+								},
+							],
+							timestamp: Date.now(),
+						};
+
+						const response = await complete(
+							ctx.model!,
+							{ systemPrompt: SYSTEM_PROMPT, messages: [userMessage] },
 							{
-								type: "text",
-								text: `## Conversation History\n\n${conversationText}\n\n## User's Goal for New Thread\n\n${goal}`,
+								apiKey: auth.apiKey,
+								headers: auth.headers,
+								signal: loader.signal,
 							},
-						],
-						timestamp: Date.now(),
+						);
+
+						if (response.stopReason === "aborted") {
+							return null;
+						}
+
+						return response.content
+							.filter(
+								(c): c is { type: "text"; text: string } => c.type === "text",
+							)
+							.map((c) => c.text)
+							.join("\n");
 					};
 
-					const response = await complete(
-						ctx.model!,
-						{ systemPrompt: SYSTEM_PROMPT, messages: [userMessage] },
-						{ apiKey, signal: loader.signal },
-					);
+					doGenerate()
+						.then(done)
+						.catch((err) => {
+							console.error("Handoff generation failed:", err);
+							done(null);
+						});
 
-					if (response.stopReason === "aborted") {
-						return null;
-					}
-
-					return response.content
-						.filter((c): c is { type: "text"; text: string } => c.type === "text")
-						.map((c) => c.text)
-						.join("\n");
-				};
-
-				doGenerate()
-					.then(done)
-					.catch((err) => {
-						console.error("Handoff generation failed:", err);
-						done(null);
-					});
-
-				return loader;
-			});
+					return loader;
+				},
+			);
 
 			if (result === null) {
 				ctx.ui.notify("Cancelled", "info");
